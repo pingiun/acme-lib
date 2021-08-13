@@ -5,8 +5,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::acc::AcmeKey;
+use crate::api::ApiProblem;
 use crate::jwt::*;
-use crate::req::{req_expect_header, req_handle_error, req_head, req_post};
+use crate::req::{req_expect_header, req_extract_res, req_handle_error, req_head, req_post};
 use crate::util::base64url;
 use crate::Result;
 
@@ -112,7 +113,11 @@ impl NoncePool {
         }
     }
 
-    fn extract_nonce(&self, res: &ureq::Response) {
+    fn extract_nonce(&self, res: &std::result::Result<ureq::Response, ureq::Error>) {
+        let res = match req_extract_res(res) {
+            Some(x) => x,
+            None => return,
+        };
         if let Some(nonce) = res.header("replay-nonce") {
             trace!("Extract nonce");
             let mut pool = self.pool.lock().unwrap();
@@ -133,6 +138,11 @@ impl NoncePool {
         }
         debug!("Request new nonce");
         let res = req_head(&self.nonce_url);
+        let res = req_extract_res(&res).ok_or_else(|| ApiProblem {
+            _type: format!("Missing header: {}", "replay-nonce"),
+            detail: None,
+            subproblems: None,
+        })?;
         Ok(req_expect_header(&res, "replay-nonce")?)
     }
 }

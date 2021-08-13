@@ -1,66 +1,91 @@
+use lazy_static::lazy_static;
+use std::time::Duration;
+
 use crate::api::ApiProblem;
 
 pub(crate) type ReqResult<T> = std::result::Result<T, ApiProblem>;
 
-pub(crate) fn req_get(url: &str) -> ureq::Response {
-    let mut req = ureq::get(url);
-    req_configure(&mut req);
+lazy_static! {
+    static ref AGENT: ureq::Agent = req_configure(ureq::AgentBuilder::new()).build();
+}
+
+pub(crate) fn req_get(url: &str) -> Result<ureq::Response, ureq::Error> {
+    let req = AGENT.get(url);
     trace!("{:?}", req);
     req.call()
 }
 
-pub(crate) fn req_head(url: &str) -> ureq::Response {
-    let mut req = ureq::head(url);
-    req_configure(&mut req);
+pub(crate) fn req_head(url: &str) -> Result<ureq::Response, ureq::Error> {
+    let req = AGENT.head(url);
     trace!("{:?}", req);
     req.call()
 }
 
-pub(crate) fn req_post(url: &str, body: &str) -> ureq::Response {
-    let mut req = ureq::post(url);
-    req.set("content-type", "application/jose+json");
-    req_configure(&mut req);
+pub(crate) fn req_post(url: &str, body: &str) -> Result<ureq::Response, ureq::Error> {
+    let req = AGENT.post(url);
+    let req = req.set("content-type", "application/jose+json");
     trace!("{:?} {}", req, body);
     req.send_string(body)
 }
 
-fn req_configure(req: &mut ureq::Request) {
-    req.timeout_connect(30_000);
-    req.timeout_read(30_000);
-    req.timeout_write(30_000);
+fn req_configure(agent: ureq::AgentBuilder) -> ureq::AgentBuilder {
+    agent
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
 }
 
-pub(crate) fn req_handle_error(res: ureq::Response) -> ReqResult<ureq::Response> {
+pub(crate) fn req_handle_error(
+    res: Result<ureq::Response, ureq::Error>,
+) -> ReqResult<ureq::Response> {
     // ok responses pass through
-    if res.ok() {
+    if let Ok(res) = res {
         return Ok(res);
     }
 
-    let problem = if res.content_type() == "application/problem+json" {
-        // if we were sent a problem+json, deserialize it
-        let body = req_safe_read_body(res);
-        serde_json::from_str(&body).unwrap_or_else(|e| ApiProblem {
-            _type: "problemJsonFail".into(),
-            detail: Some(format!(
-                "Failed to deserialize application/problem+json ({}) body: {}",
-                e.to_string(),
-                body
-            )),
-            subproblems: None,
-        })
-    } else {
-        // some other problem
-        let status = format!("{} {}", res.status(), res.status_text());
-        let body = req_safe_read_body(res);
-        let detail = format!("{} body: {}", status, body);
-        ApiProblem {
-            _type: "httpReqError".into(),
-            detail: Some(detail),
-            subproblems: None,
+    match res {
+        Ok(res) => Ok(res),
+        Err(ureq::Error::Status(status, res)) => {
+            Err(if res.content_type() == "application/problem+json" {
+                // if we were sent a problem+json, deserialize it
+                let body = req_safe_read_body(res);
+                serde_json::from_str(&body).unwrap_or_else(|e| ApiProblem {
+                    _type: "problemJsonFail".into(),
+                    detail: Some(format!(
+                        "Failed to deserialize application/problem+json ({}) body: {}",
+                        e.to_string(),
+                        body
+                    )),
+                    subproblems: None,
+                })
+            } else {
+                // some other problem
+                let status = format!("{} {}", status, res.status_text());
+                let body = req_safe_read_body(res);
+                let detail = format!("{} body: {}", status, body);
+                ApiProblem {
+                    _type: "httpReqError".into(),
+                    detail: Some(detail),
+                    subproblems: None,
+                }
+            })
         }
-    };
+        Err(ureq::Error::Transport(transport)) => Err(ApiProblem {
+            _type: "httpReqError".into(),
+            detail: Some(transport.to_string()),
+            subproblems: None,
+        }),
+    }
+}
 
-    Err(problem)
+pub(crate) fn req_extract_res(
+    res: &Result<ureq::Response, ureq::Error>,
+) -> Option<&ureq::Response> {
+    match res {
+        Ok(res) => Some(res),
+        Err(ureq::Error::Status(_status, res)) => Some(res),
+        Err(ureq::Error::Transport(_)) => None,
+    }
 }
 
 pub(crate) fn req_expect_header(res: &ureq::Response, name: &str) -> ReqResult<String> {
